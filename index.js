@@ -10,39 +10,55 @@ const ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_NUMBER = process.env.TWILIO_NUMBER;
 
-// Step 1: Incoming call hits this endpoint
-// Immediately plays song to caller AND dials Number 3 in background
+// Step 1: Caller dials in - put them in a conference and play song while waiting
 app.post('/incoming', (req, res) => {
   const callSid = req.body.CallSid;
+  const conferenceName = `conf_${callSid}`;
   const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
 
-  // Dial Number 3 in the background as a separate call leg
+  // Simultaneously dial Number 3 in the background
   client.calls.create({
-    url: `${process.env.APP_URL}/bridge?originalCall=${callSid}`,
+    url: `${process.env.APP_URL}/agent-join?conf=${conferenceName}`,
     to: FORWARD_TO,
     from: TWILIO_NUMBER,
-  });
+  }).catch(err => console.error('Outbound call error:', err));
 
-  // Caller hears the song on loop while waiting
+  // Put caller into conference - they hear song via waitUrl until agent joins
   const twiml = new twilio.twiml.VoiceResponse();
-  twiml.play({ loop: 99 }, SONG_URL);
+  const dial = twiml.dial();
+  dial.conference(conferenceName, {
+    startConferenceOnEnter: true,
+    endConferenceOnExit: true,
+    waitUrl: `${process.env.APP_URL}/wait-music`,
+    waitMethod: 'GET',
+    beep: false,
+    muted: false,
+  });
 
   res.type('text/xml');
   res.send(twiml.toString());
 });
 
-// Step 2: Number 3 answers - bridge both legs together, song stops
-app.post('/bridge', (req, res) => {
-  const originalCall = req.query.originalCall;
-  const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
+// Wait music - plays song to caller while they wait in conference
+app.get('/wait-music', (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.play({ loop: 99 }, SONG_URL);
+  res.type('text/xml');
+  res.send(twiml.toString());
+});
 
-  // Stop the song on the caller's leg and bridge them together
-  client.calls(originalCall).update({
-    twiml: `<Response><Dial><Number>${FORWARD_TO}</Number></Dial></Response>`
-  });
+// Step 2: Number 3 (GHL) answers - joins same conference, song stops automatically
+app.post('/agent-join', (req, res) => {
+  const conferenceName = req.query.conf;
 
   const twiml = new twilio.twiml.VoiceResponse();
-  twiml.say('Connecting you now.');
+  const dial = twiml.dial();
+  dial.conference(conferenceName, {
+    startConferenceOnEnter: true,
+    endConferenceOnExit: true,
+    beep: false,
+  });
+
   res.type('text/xml');
   res.send(twiml.toString());
 });
