@@ -16,19 +16,20 @@ app.post('/incoming', (req, res) => {
   const conferenceName = `conf_${callSid}`;
   const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
 
-  // Dial agent in background - agent's join will START the conference
-  client.calls.create({
-    url: `${process.env.APP_URL}/agent-join?conf=${conferenceName}`,
-    to: FORWARD_TO,
-    from: TWILIO_NUMBER,
-  }).catch(err => console.error('Outbound call error:', err));
+  // Wait 2 seconds before dialing so waitUrl music has time to start
+  setTimeout(() => {
+    client.calls.create({
+      url: `${process.env.APP_URL}/agent-join?conf=${conferenceName}`,
+      to: FORWARD_TO,
+      from: TWILIO_NUMBER,
+    }).catch(err => console.error('Outbound call error:', err));
+  }, 2000);
 
-  // Caller waits in conference - startConferenceOnEnter FALSE
-  // This means caller hears waitUrl music until agent joins
+  // Caller waits in conference and hears music
   const twiml = new twilio.twiml.VoiceResponse();
   const dial = twiml.dial();
   dial.conference(conferenceName, {
-    startConferenceOnEnter: false,  // <-- KEY: caller waits, hears music
+    startConferenceOnEnter: false,
     endConferenceOnExit: true,
     waitUrl: WAIT_MUSIC_URL,
     waitMethod: 'GET',
@@ -42,11 +43,10 @@ app.post('/incoming', (req, res) => {
 app.post('/agent-join', (req, res) => {
   const conferenceName = req.query.conf;
 
-  // Agent joins and STARTS the conference - music stops for caller
   const twiml = new twilio.twiml.VoiceResponse();
   const dial = twiml.dial();
   dial.conference(conferenceName, {
-    startConferenceOnEnter: true,   // <-- Agent starts the conference
+    startConferenceOnEnter: true,
     endConferenceOnExit: true,
     beep: false,
   });
