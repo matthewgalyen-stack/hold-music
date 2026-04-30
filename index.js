@@ -15,8 +15,17 @@ const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
 
 const TEAM = ['+16128592408', '+16125700275'];
 
-// Store call info in memory
 const callStore = {};
+
+// Shuffle array randomly (Fisher-Yates)
+function shuffleArray(arr) {
+  const shuffled = [...arr];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+}
 
 // --- GHL API Helpers ---
 
@@ -33,8 +42,7 @@ async function findContactByPhone(phone) {
 }
 
 async function updateContact(contactId, fields) {
-  const url = `https://services.leadconnectorhq.com/contacts/${contactId}`;
-  await fetch(url, {
+  await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
     method: 'PUT',
     headers: {
       'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -46,8 +54,7 @@ async function updateContact(contactId, fields) {
 }
 
 async function addNoteToContact(contactId, note) {
-  const url = `https://services.leadconnectorhq.com/contacts/${contactId}/notes`;
-  await fetch(url, {
+  await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -58,9 +65,8 @@ async function addNoteToContact(contactId, note) {
   });
 }
 
-async function createContact(phone, fields) {
-  const url = `https://services.leadconnectorhq.com/contacts/`;
-  const res = await fetch(url, {
+async function createContact(phone) {
+  const res = await fetch(`https://services.leadconnectorhq.com/contacts/`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -70,7 +76,7 @@ async function createContact(phone, fields) {
     body: JSON.stringify({
       locationId: GHL_LOCATION_ID,
       phone,
-      ...fields,
+      source: 'Inbound Call',
     }),
   });
   const data = await res.json();
@@ -85,11 +91,20 @@ app.post('/incoming', (req, res) => {
   const conferenceName = `conf_${callSid}`;
   const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
 
+  // Generate a new random order for this call
+  const dialOrder = shuffleArray(TEAM);
+  console.log(`Dial order for this call: ${dialOrder.join(', ')}`);
+
   callStore[conferenceName] = {
     startTime: Date.now(),
     callerNumber,
     callSid,
     answeredBy: null,
+    answered: false,
+    callerHungUp: false,
+    connected: false,
+    dialOrder,         // randomized order stored per call
+    roundCount: 0,     // track how many full rounds completed
   };
 
   setTimeout(() => {
@@ -107,70 +122,112 @@ app.post('/incoming', (req, res) => {
     record: 'record-from-start',
     recordingStatusCallback: `${APP_URL}/recording-done?conf=${conferenceName}`,
     recordingStatusCallbackMethod: 'POST',
+    statusCallback: `${APP_URL}/caller-status?conf=${conferenceName}`,
+    statusCallbackEvent: ['leave'],
+    statusCallbackMethod: 'POST',
   });
 
   res.type('text/xml');
   res.send(twiml.toString());
 });
 
-function dialNext(client, conferenceName, index) {
-  if (index >= TEAM.length) index = 0;
-  const number = TEAM[index];
-  console.log(`Dialing ${number} (index ${index})`);
-
-  client.calls.create({
-    url: `${APP_URL}/agent-join?conf=${conferenceName}&index=${index}`,
-    to: number,
-    from: TWILIO_NUMBER,
-    timeout: 20,
-    statusCallback: `${APP_URL}/no-answer?conf=${conferenceName}&index=${index}`,
-    statusCallbackEvent: ['no-answer', 'busy', 'failed'],
-    statusCallbackMethod: 'POST',
-  }).catch(err => console.error('Dial error:', err));
-}
-
-app.post('/agent-join', (req, res) => {
+// Fires when caller leaves the conference
+app.post('/caller-status', (req, res) => {
   const conferenceName = req.query.conf;
   if (callStore[conferenceName]) {
-    callStore[conferenceName].answeredBy = req.body.To;
-    callStore[conferenceName].answerTime = Date.now();
+    console.log(`Caller left conference ${conferenceName} - stopping all dialing`);
+    callStore[conferenceName].callerHungUp = true;
+    callStore[conferenceName].answered = true;
   }
-
-  const twiml = new twilio.twiml.VoiceResponse();
-  const dial = twiml.dial();
-  dial.conference(conferenceName, {
-    startConferenceOnEnter: true,
-    endConferenceOnExit: true,
-    beep: false,
-  });
-
-  res.type('text/xml');
-  res.send(twiml.toString());
-});
-
-app.post('/no-answer', (req, res) => {
-  const conferenceName = req.query.conf;
-  const index = parseInt(req.query.index);
-  const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
-
-  console.log(`No answer from ${TEAM[index]}, trying next...`);
-  setTimeout(() => {
-    dialNext(client, conferenceName, index + 1);
-  }, 2000);
-
   res.sendStatus(200);
 });
 
-// Recording done - update GHL contact via API
+function dialNext(client, conferenceName, index) {
+  const store = callStore[conferenceName];
+
+  if (!store || store.callerHungUp || store.connected) {
+    console.log(`Stopping dial loop for ${conferenceName}`);
+    return;
+  }
+
+  // When we complete a full round, reshuffle for equal weight distribution
+  if (index >= store.dialOrder.length) {
+    store.roundCount++;
+    store.dialOrder = shuffleArray(TEAM);
+    console.log(`Round ${store.roundCount} complete. New order: ${store.dialOrder.join(', ')}`);
+    index = 0;
+  }
+
+  const number = store.dialOrder[index];
+  console.log(`Dialing ${number} (position ${index + 1} of ${store.dialOrder.length})`);
+
+  client.calls.create({
+    url: `${APP_URL}/dial-status?conf=${conferenceName}&index=${index}`,
+    to: number,
+    from: TWILIO_NUMBER,
+    timeout: 20,
+  }).catch(err => console.error('Dial error:', err));
+}
+
+// Fires when outbound call leg ends for any reason
+app.post('/dial-status', (req, res) => {
+  const conferenceName = req.query.conf;
+  const index = parseInt(req.query.index);
+  const callStatus = req.body.CallStatus;
+  const store = callStore[conferenceName];
+  const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
+
+  const number = store?.dialOrder?.[index] || 'unknown';
+  console.log(`Call to ${number} ended with status: ${callStatus}`);
+
+  if (!store || store.callerHungUp) {
+    console.log(`Caller already gone, ignoring dial result`);
+    const twiml = new twilio.twiml.VoiceResponse();
+    twiml.hangup();
+    res.type('text/xml');
+    res.send(twiml.toString());
+    return;
+  }
+
+  if (callStatus === 'in-progress' || callStatus === 'answered') {
+    store.answered = true;
+    store.connected = true;
+    store.answeredBy = number;
+
+    const twiml = new twilio.twiml.VoiceResponse();
+    const dial = twiml.dial();
+    dial.conference(conferenceName, {
+      startConferenceOnEnter: true,
+      endConferenceOnExit: false,
+      beep: false,
+    });
+
+    res.type('text/xml');
+    res.send(twiml.toString());
+  } else {
+    console.log(`No answer from ${number}, trying next...`);
+    if (store) store.connected = false;
+
+    setTimeout(() => {
+      dialNext(client, conferenceName, index + 1);
+    }, 1000);
+
+    const twiml = new twilio.twiml.VoiceResponse();
+    twiml.hangup();
+    res.type('text/xml');
+    res.send(twiml.toString());
+  }
+});
+
+// Recording done - update GHL contact
 app.post('/recording-done', async (req, res) => {
   const conferenceName = req.query.conf;
   const recordingUrl = req.body.RecordingUrl + '.mp3';
-  const recordingDuration = req.body.RecordingDuration;
   const callData = callStore[conferenceName] || {};
 
   const totalDuration = callData.startTime
     ? Math.round((Date.now() - callData.startTime) / 1000)
-    : recordingDuration;
+    : req.body.RecordingDuration;
 
   const callerNumber = callData.callerNumber;
   const answeredBy = callData.answeredBy || 'No answer';
@@ -178,19 +235,12 @@ app.post('/recording-done', async (req, res) => {
   console.log(`Call ended. Caller: ${callerNumber}, Duration: ${totalDuration}s, Answered by: ${answeredBy}`);
 
   try {
-    // Find or create contact in GHL
     let contactId = await findContactByPhone(callerNumber);
-
     if (!contactId) {
-      console.log('Contact not found, creating new one...');
-      contactId = await createContact(callerNumber, {
-        firstName: 'Unknown',
-        source: 'Inbound Call',
-      });
+      contactId = await createContact(callerNumber);
     }
 
     if (contactId) {
-      // Update contact with call details
       await updateContact(contactId, {
         customFields: [
           { key: 'recording_url', field_value: recordingUrl },
@@ -199,7 +249,6 @@ app.post('/recording-done', async (req, res) => {
         ],
       });
 
-      // Add note to contact timeline
       const date = new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' });
       await addNoteToContact(contactId,
         `📞 Inbound Call — ${date}\n` +
