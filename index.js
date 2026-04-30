@@ -166,10 +166,13 @@ function dialNext(client, conferenceName, index) {
     to: number,
     from: TWILIO_NUMBER,
     timeout: 20,
+    statusCallback: `${APP_URL}/dial-status?conf=${conferenceName}&index=${index}`,
+    statusCallbackEvent: ['no-answer', 'busy', 'failed', 'completed'],
+    statusCallbackMethod: 'POST',
   }).catch(err => console.error('Dial error:', err));
 }
 
-// Fires when outbound call leg ends for any reason
+// Fires when outbound call is answered (url param) OR ends via statusCallback
 app.post('/dial-status', (req, res) => {
   const conferenceName = req.query.conf;
   const index = parseInt(req.query.index);
@@ -178,10 +181,11 @@ app.post('/dial-status', (req, res) => {
   const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
 
   const number = store?.dialOrder?.[index] || 'unknown';
-  console.log(`Call to ${number} ended with status: ${callStatus}`);
+  console.log(`/dial-status for ${number} - CallStatus: ${callStatus}`);
 
+  // If caller already hung up, do nothing
   if (!store || store.callerHungUp) {
-    console.log(`Caller already gone, ignoring dial result`);
+    console.log(`Caller already gone, ignoring`);
     const twiml = new twilio.twiml.VoiceResponse();
     twiml.hangup();
     res.type('text/xml');
@@ -189,10 +193,19 @@ app.post('/dial-status', (req, res) => {
     return;
   }
 
-  if (callStatus === 'in-progress' || callStatus === 'answered') {
+  // If already connected to someone, ignore stale callbacks
+  if (store.connected && callStatus !== 'in-progress') {
+    console.log(`Already connected, ignoring status: ${callStatus}`);
+    res.sendStatus(200);
+    return;
+  }
+
+  if (callStatus === 'in-progress') {
+    // Called party answered - join the conference
     store.answered = true;
     store.connected = true;
     store.answeredBy = number;
+    console.log(`${number} answered - joining conference`);
 
     const twiml = new twilio.twiml.VoiceResponse();
     const dial = twiml.dial();
@@ -204,18 +217,30 @@ app.post('/dial-status', (req, res) => {
 
     res.type('text/xml');
     res.send(twiml.toString());
-  } else {
-    console.log(`No answer from ${number}, trying next...`);
-    if (store) store.connected = false;
+  } else if (callStatus === 'no-answer' || callStatus === 'busy' || callStatus === 'failed') {
+    // No answer - try next number
+    console.log(`No answer from ${number} (${callStatus}), trying next...`);
+    store.connected = false;
 
     setTimeout(() => {
       dialNext(client, conferenceName, index + 1);
     }, 1000);
 
-    const twiml = new twilio.twiml.VoiceResponse();
-    twiml.hangup();
-    res.type('text/xml');
-    res.send(twiml.toString());
+    res.sendStatus(200);
+  } else if (callStatus === 'completed') {
+    // Agent hung up - if caller still there, dial next
+    if (!store.callerHungUp) {
+      console.log(`Agent ${number} hung up, caller still on line - dialing next...`);
+      store.connected = false;
+      store.answered = false;
+
+      setTimeout(() => {
+        dialNext(client, conferenceName, index + 1);
+      }, 1000);
+    }
+    res.sendStatus(200);
+  } else {
+    res.sendStatus(200);
   }
 });
 
