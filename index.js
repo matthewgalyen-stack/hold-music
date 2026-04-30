@@ -215,7 +215,7 @@ app.post('/dial-status', (req, res) => {
     const dial = twiml.dial();
     dial.conference(conferenceName, {
       startConferenceOnEnter: true,
-      endConferenceOnExit: false,
+      endConferenceOnExit: true,
       beep: false,
     });
 
