@@ -14,10 +14,8 @@ const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
 
 const TEAM = ['+16128592408', '+16125700275'];
-
 const callStore = {};
 
-// Shuffle array randomly (Fisher-Yates)
 function shuffleArray(arr) {
   const shuffled = [...arr];
   for (let i = shuffled.length - 1; i > 0; i--) {
@@ -32,10 +30,7 @@ function shuffleArray(arr) {
 async function findContactByPhone(phone) {
   const url = `https://services.leadconnectorhq.com/contacts/search/duplicate?locationId=${GHL_LOCATION_ID}&number=${encodeURIComponent(phone)}`;
   const res = await fetch(url, {
-    headers: {
-      'Authorization': `Bearer ${GHL_API_KEY}`,
-      'Version': '2021-07-28',
-    },
+    headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28' },
   });
   const data = await res.json();
   return data?.contact?.id || null;
@@ -44,11 +39,7 @@ async function findContactByPhone(phone) {
 async function updateContact(contactId, fields) {
   await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
     method: 'PUT',
-    headers: {
-      'Authorization': `Bearer ${GHL_API_KEY}`,
-      'Version': '2021-07-28',
-      'Content-Type': 'application/json',
-    },
+    headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
     body: JSON.stringify(fields),
   });
 }
@@ -56,11 +47,7 @@ async function updateContact(contactId, fields) {
 async function addNoteToContact(contactId, note) {
   await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${GHL_API_KEY}`,
-      'Version': '2021-07-28',
-      'Content-Type': 'application/json',
-    },
+    headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
     body: JSON.stringify({ body: note }),
   });
 }
@@ -68,19 +55,25 @@ async function addNoteToContact(contactId, note) {
 async function createContact(phone) {
   const res = await fetch(`https://services.leadconnectorhq.com/contacts/`, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${GHL_API_KEY}`,
-      'Version': '2021-07-28',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      locationId: GHL_LOCATION_ID,
-      phone,
-      source: 'Inbound Call',
-    }),
+    headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ locationId: GHL_LOCATION_ID, phone, source: 'Inbound Call' }),
   });
   const data = await res.json();
   return data?.contact?.id || null;
+}
+
+// Cancel all active outbound calls for this conference
+async function cancelActiveCalls(store) {
+  const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
+  for (const callSid of (store.activeCallSids || [])) {
+    try {
+      await client.calls(callSid).update({ status: 'canceled' });
+      console.log(`Canceled call ${callSid}`);
+    } catch (e) {
+      // Call may have already ended, ignore
+    }
+  }
+  store.activeCallSids = [];
 }
 
 // --- Call Routes ---
@@ -91,7 +84,6 @@ app.post('/incoming', (req, res) => {
   const conferenceName = `conf_${callSid}`;
   const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
 
-  // Generate a new random order for this call
   const dialOrder = shuffleArray(TEAM);
   console.log(`Dial order for this call: ${dialOrder.join(', ')}`);
 
@@ -103,8 +95,9 @@ app.post('/incoming', (req, res) => {
     answered: false,
     callerHungUp: false,
     connected: false,
-    dialOrder,         // randomized order stored per call
-    roundCount: 0,     // track how many full rounds completed
+    dialOrder,
+    roundCount: 0,
+    activeCallSids: [], // track outbound call SIDs so we can cancel them
   };
 
   setTimeout(() => {
@@ -132,25 +125,26 @@ app.post('/incoming', (req, res) => {
 });
 
 // Fires when caller leaves the conference
-app.post('/caller-status', (req, res) => {
+app.post('/caller-status', async (req, res) => {
   const conferenceName = req.query.conf;
-  if (callStore[conferenceName]) {
-    console.log(`Caller left conference ${conferenceName} - stopping all dialing`);
-    callStore[conferenceName].callerHungUp = true;
-    callStore[conferenceName].answered = true;
+  const store = callStore[conferenceName];
+  if (store) {
+    console.log(`Caller left conference ${conferenceName} - canceling all outbound calls`);
+    store.callerHungUp = true;
+    store.answered = true;
+    // Immediately cancel any ringing outbound calls
+    await cancelActiveCalls(store);
   }
   res.sendStatus(200);
 });
 
 function dialNext(client, conferenceName, index) {
   const store = callStore[conferenceName];
-
   if (!store || store.callerHungUp || store.connected) {
     console.log(`Stopping dial loop for ${conferenceName}`);
     return;
   }
 
-  // When we complete a full round, reshuffle for equal weight distribution
   if (index >= store.dialOrder.length) {
     store.roundCount++;
     store.dialOrder = shuffleArray(TEAM);
@@ -169,10 +163,20 @@ function dialNext(client, conferenceName, index) {
     statusCallback: `${APP_URL}/dial-status?conf=${conferenceName}&index=${index}`,
     statusCallbackEvent: ['no-answer', 'busy', 'failed', 'completed'],
     statusCallbackMethod: 'POST',
+  }).then(call => {
+    // Store the SID so we can cancel it if caller hangs up
+    if (store && !store.callerHungUp) {
+      store.activeCallSids = store.activeCallSids || [];
+      store.activeCallSids.push(call.sid);
+      console.log(`Tracking outbound call SID: ${call.sid}`);
+    } else {
+      // Caller already hung up before we could track - cancel immediately
+      client.calls(call.sid).update({ status: 'canceled' }).catch(() => {});
+    }
   }).catch(err => console.error('Dial error:', err));
 }
 
-// Fires when outbound call is answered (url param) OR ends via statusCallback
+// Fires when outbound call is answered or ends
 app.post('/dial-status', (req, res) => {
   const conferenceName = req.query.conf;
   const index = parseInt(req.query.index);
@@ -183,17 +187,17 @@ app.post('/dial-status', (req, res) => {
   const number = store?.dialOrder?.[index] || 'unknown';
   console.log(`/dial-status for ${number} - CallStatus: ${callStatus}`);
 
-  // If caller already hung up, do nothing
+  // Caller already hung up - just hang up on the agent
   if (!store || store.callerHungUp) {
-    console.log(`Caller already gone, ignoring`);
+    console.log(`Caller already gone - hanging up on ${number}`);
     const twiml = new twilio.twiml.VoiceResponse();
+    twiml.say('Sorry, the caller has hung up.');
     twiml.hangup();
     res.type('text/xml');
     res.send(twiml.toString());
     return;
   }
 
-  // If already connected to someone, ignore stale callbacks
   if (store.connected && callStatus !== 'in-progress') {
     console.log(`Already connected, ignoring status: ${callStatus}`);
     res.sendStatus(200);
@@ -201,7 +205,7 @@ app.post('/dial-status', (req, res) => {
   }
 
   if (callStatus === 'in-progress') {
-    // Called party answered - join the conference
+    // Agent answered - join conference, music stops
     store.answered = true;
     store.connected = true;
     store.answeredBy = number;
@@ -217,8 +221,8 @@ app.post('/dial-status', (req, res) => {
 
     res.type('text/xml');
     res.send(twiml.toString());
+
   } else if (callStatus === 'no-answer' || callStatus === 'busy' || callStatus === 'failed') {
-    // No answer - try next number
     console.log(`No answer from ${number} (${callStatus}), trying next...`);
     store.connected = false;
 
@@ -227,6 +231,7 @@ app.post('/dial-status', (req, res) => {
     }, 1000);
 
     res.sendStatus(200);
+
   } else if (callStatus === 'completed') {
     // Agent hung up - if caller still there, dial next
     if (!store.callerHungUp) {
@@ -239,6 +244,7 @@ app.post('/dial-status', (req, res) => {
       }, 1000);
     }
     res.sendStatus(200);
+
   } else {
     res.sendStatus(200);
   }
@@ -261,9 +267,7 @@ app.post('/recording-done', async (req, res) => {
 
   try {
     let contactId = await findContactByPhone(callerNumber);
-    if (!contactId) {
-      contactId = await createContact(callerNumber);
-    }
+    if (!contactId) contactId = await createContact(callerNumber);
 
     if (contactId) {
       await updateContact(contactId, {
